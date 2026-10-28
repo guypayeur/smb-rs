@@ -722,17 +722,27 @@ pub mod iter_stream {
                         }
                     }
                     Err(e) => {
-                        if sender.send(Err(e)).await.is_err() {
-                            return; // Receiver dropped
-                        }
+                        let _ = sender.send(Err(e)).await;
+                        // Do not query again after an error: the stream ends here.
+                        return;
                     }
                 }
 
-                // Notify the stream that a new batch is available
-                notify_fetch_next.notify_waiters();
-                notify_fetch_next.notified().await;
+                // Flow-control after a batch. See `after_directory_batch_sent`.
+                after_directory_batch_sent(&notify_fetch_next).await;
             }
         }
+    }
+
+    /// After a directory batch has been sent to the stream consumer.
+    ///
+    /// Older code waited on `notify_fetch_next.notified()` here while the consumer
+    /// called `notify_waiters()` when the channel drained. Tokio `Notify` does not
+    /// queue permits, so a notify that arrived before `notified().await` was lost
+    /// and the producer (holding the directory handle) hung forever. The channel is
+    /// bounded, so back-pressure alone is enough; do not wait on the notify.
+    async fn after_directory_batch_sent(notify_fetch_next: &tokio::sync::Notify) {
+        let _ = notify_fetch_next;
     }
 
     impl<'a, T> Stream for QueryDirectoryStream<'a, T>
@@ -753,6 +763,80 @@ pub mod iter_stream {
                 Poll::Ready(None) => Poll::Ready(None), // Stream is closed!
                 Poll::Pending => Poll::Pending,
             }
+        }
+    }
+
+    /// Regression: consumer notifies before the producer parks on `Notify`.
+    #[cfg(test)]
+    mod lost_wakeup_regression {
+        use super::after_directory_batch_sent;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::{Notify, mpsc};
+
+        /// Mimics the QueryDirectoryStream producer after each batch, with the
+        /// consumer allowed to `notify_waiters` *before* `after_directory_batch_sent`
+        /// runs — the lost-wakeup ordering.
+        async fn producer_after_batches(
+            sender: mpsc::Sender<u32>,
+            notify: Arc<Notify>,
+            consumer_went_first: Arc<Notify>,
+            batches: u32,
+        ) {
+            for batch in 0..batches {
+                if sender.send(batch).await.is_err() {
+                    return;
+                }
+                // Wait until the consumer has drained and already called notify_waiters.
+                consumer_went_first.notified().await;
+                after_directory_batch_sent(&notify).await;
+            }
+        }
+
+        async fn fast_consumer(
+            mut receiver: mpsc::Receiver<u32>,
+            notify: Arc<Notify>,
+            consumer_went_first: Arc<Notify>,
+        ) -> Vec<u32> {
+            let mut got = Vec::new();
+            while let Some(item) = receiver.recv().await {
+                got.push(item);
+                if receiver.is_empty() {
+                    // Wakeup is lost if the producer has not yet reached notified().await
+                    // inside after_directory_batch_sent (Notify::notify_waiters stores nothing).
+                    notify.notify_waiters();
+                    consumer_went_first.notify_waiters();
+                }
+            }
+            got
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn producer_finishes_when_consumer_notifies_before_park() {
+            let (sender, receiver) = mpsc::channel::<u32>(1);
+            let notify = Arc::new(Notify::new());
+            let consumer_went_first = Arc::new(Notify::new());
+            let batches = 3u32;
+
+            let producer = tokio::spawn(producer_after_batches(
+                sender,
+                notify.clone(),
+                consumer_went_first.clone(),
+                batches,
+            ));
+            let consumer = tokio::spawn(fast_consumer(receiver, notify, consumer_went_first));
+
+            let finished = tokio::time::timeout(Duration::from_secs(2), async {
+                let items = consumer.await.expect("consumer join");
+                producer.await.expect("producer join");
+                items
+            })
+            .await;
+
+            let items = finished.expect(
+                "producer hung: lost Notify wakeup (consumer notified before producer parked)",
+            );
+            assert_eq!(items, vec![0, 1, 2]);
         }
     }
 }
